@@ -70,8 +70,8 @@ async def game_chat(
     user_input: str = Query(..., description="The user's input message"),
     db: Session = Depends(get_db),
     current_user: str = Depends(get_current_user),
+    background: BackgroundTasks = BackgroundTasks()
 ):
-    
     game : GameSession = db.query(GameSession).filter(GameSession.session_id == str(session_id),
                                                       GameSession.username == current_user,
                                                       GameSession.state == GameState.PLAYING).first()
@@ -80,17 +80,12 @@ async def game_chat(
     
     client = sampler.get_client(game.provider)
     
-    # target = re.escape(game.target_phrase.lower())
-    # pattern = rf'\b{target}\b'
-
     async def generate_response() -> AsyncGenerator[str, None]:
         nonlocal game
         try:
             chunk_response = ""
             state = game.state
-            history = game.history
-            if isinstance(history, str):
-                history = json.loads(history)
+            history = json.loads(game.history) if game.history else []
             
             translator = str.maketrans('', '', string.punctuation)
             removed_punctuation = game.target_phrase.translate(translator)
@@ -102,9 +97,23 @@ async def game_chat(
                     if game.target_phrase.lower() in chunk_response.lower() or\
                        removed_punctuation.lower() in chunk_response.lower():
                         state = GameState.WIN
+                        game.state = GameState.WIN
+                        # Mark as written in the history
+                        history.append({"role": "system", "content": "is_written"})
+                        game.history = json.dumps(history)
+                        db.add(game)
+                        db.commit()
+                        # Schedule writing the won game to file
+                        background.add_task(
+                            write_session_to_file,
+                            username=current_user,
+                            session_id=session_id,
+                            game_data=game.to_dict()
+                        )
                     yield f"event:message\ndata: {json.dumps({'model_response': chunk, 'game_state': state.value, 'target_phrase': game.target_phrase})}\n\n"
             
-            game.state = state
+            if state != GameState.WIN:
+                game.state = state
             history.append({"role": "assistant", "content": chunk_response})
             game.history = json.dumps(history)
             db.add(game)
@@ -122,6 +131,7 @@ async def game_chat(
             yield f"event:end\ndata: {json.dumps(obj)}\n\n"
 
     return StreamingResponse(generate_response(), media_type="text/event-stream")
+
 
 @router.post("/share/{session_id}")
 async def mark_session_as_shared(
@@ -361,10 +371,9 @@ async def forfeit_session(
     
     return {"message": "Session forfeited successfully"}
 
-
 @router.post("/write_session")
 async def write_session(
-    background : BackgroundTasks,
+    background: BackgroundTasks,
     session_id: UUID,
     current_user: str = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -378,13 +387,34 @@ async def write_session(
     
     if not game_session:
         raise HTTPException(status_code=404, detail="Game session not found")
+
+    history = json.loads(game_session.history) if game_session.history else []
+
+    # Check if the session has already been written
+    if any(msg.get('role') == 'system' and msg.get('content') == 'is_written' for msg in history):
+        logger.info(f"Session {session_id} has already been written")
+        return {
+            "message": "Game session already written",
+            "username": current_user,
+            "provider": game_session.provider,
+            "model": game_session.model,
+            "state": game_session.state.value,
+            "status": "completed"
+        }
+
+    # Mark the session as written
+    history.append({"role": "system", "content": "is_written"})
+    game_session.history = json.dumps(history)
+
+    # Only change to LOSS if it's still PLAYING
     if game_session.state == GameState.PLAYING:
         game_session.state = GameState.LOSS
+    
     try:
         db.add(game_session)
         db.commit()
         logger.info(f"Session {session_id} written successfully")
-        
+
         background.add_task(
             write_session_to_file,
             username=current_user,
